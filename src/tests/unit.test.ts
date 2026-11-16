@@ -1,12 +1,13 @@
 import '../boot.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { Db } from '../db/database.js';
 import { Repo, ftsQuery } from '../db/repo.js';
 import { toJid, normalizePhone, kindOf } from '../wa/jid.js';
 import { normalizeMessage, parseRaw } from '../wa/message-utils.js';
 import { assertReadablePath, sniffMime, extFromMime } from '../wa/media.js';
-import { loadConfig } from '../config.js';
+import { loadConfig, defaultDataDir } from '../config.js';
 import { parseTime } from '../mcp/tools/read.js';
 
 test('jid helpers', () => {
@@ -125,4 +126,14 @@ test('quotes are resolved: author (me / name), time, full text from the local st
   assert.equal(r2.quoted.from, 'me', 'quote of my own message (lid form) is labelled me');
   assert.equal(r3.quoted.unavailable, true);
   assert.equal(r3.quoted.not_in_local_store, true);
+});
+
+test('defaultDataDir: checkout keeps <project>/data, npm/npx install uses the user home', () => {
+  const home = path.join(path.sep, 'home', 'u');
+  const checkout = path.join(path.sep, 'work', 'whatsapp-mcp');
+  assert.equal(defaultDataDir(checkout, home), path.join(checkout, 'data'));
+  const npx = path.join(home, '.npm', '_npx', 'ab12', 'node_modules', 'whatsapp-baileys-mcp');
+  assert.equal(defaultDataDir(npx, home), path.join(home, '.whatsapp-mcp'));
+  const local = path.join(path.sep, 'proj', 'node_modules', 'whatsapp-baileys-mcp');
+  assert.equal(defaultDataDir(local, home), path.join(home, '.whatsapp-mcp'));
 });

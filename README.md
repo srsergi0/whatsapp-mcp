@@ -14,6 +14,8 @@ npm run build
 npm test            # 41 tests: unitarios, ingesta de eventos, envío, e2e stdio y HTTP
 ```
 
+¿Sin nada instalado y con un agente que lo haga por ti? Pégale el prompt de [INSTALL_PROMPT.md](INSTALL_PROMPT.md): comprueba Node, clona, compila, registra el MCP y vincula tu número.
+
 Requisitos: Node ≥ 22.13 (usa `node:sqlite` con FTS5, sin compilar nada nativo). `ffmpeg` en el PATH es opcional (notas de voz y stickers animados).
 
 ## Vincular tu número (código de emparejamiento)

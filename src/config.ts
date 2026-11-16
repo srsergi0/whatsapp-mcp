@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -57,9 +58,19 @@ export interface Config {
   version: string;
 }
 
+/**
+ * Default data dir. A source checkout keeps `<project>/data` (unchanged behaviour). When running
+ * from an npm install / npx cache the package folder is disposable, so sessions would be lost on
+ * every update: use a per-user folder instead.
+ */
+export function defaultDataDir(root: string = PROJECT_ROOT, home: string = os.homedir()): string {
+  const installed = /[\\/](node_modules|_npx)[\\/]/.test(root + path.sep);
+  return installed ? path.join(home, '.whatsapp-mcp') : path.join(root, 'data');
+}
+
 export function loadConfig(): Config {
   const e = process.env;
-  const dataDir = path.resolve(e.WA_MCP_DATA_DIR || path.join(PROJECT_ROOT, 'data'));
+  const dataDir = path.resolve(e.WA_MCP_DATA_DIR || defaultDataDir());
   const raw = list(e.WA_MCP_TOOLSETS).flatMap((t) => (t === 'lite' ? ['sessions', 'messages', 'read', 'contacts', 'groups', 'memory'] : [t]));
   const requested = raw.filter((t): t is Toolset => (TOOLSETS as readonly string[]).includes(t));
   return {

@@ -1,16 +1,26 @@
 {
-  "name": "whatsapp-mcp",
+  "name": "whatsapp-baileys-mcp",
   "version": "1.0.0",
   "description": "MCP server for WhatsApp (Baileys): multi-session, SQLite persistence, full messaging/groups/chats/contacts toolset",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "whatsapp-mcp": "dist/index.js"
+    "whatsapp-baileys-mcp": "dist/index.js",
+    "whatsapp-baileys-mcp-cli": "dist/cli.js"
   },
+  "files": [
+    "dist",
+    "!dist/tests",
+    "!dist/**/*.map",
+    ".env.example"
+  ],
+  "keywords": ["mcp", "model-context-protocol", "whatsapp", "baileys", "claude"],
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test",
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
