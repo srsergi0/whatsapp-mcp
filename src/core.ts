@@ -9,6 +9,7 @@ import { WaSession, type SessionHub } from './wa/session.js';
 import { errMsg } from './util.js';
 import { sendScheduled } from './wa/send.js';
 import { bare, isGroupJid, phoneOf } from './wa/jid.js';
+import { HealthGuard } from './wa/health.js';
 
 const SESSION_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/;
 
@@ -18,6 +19,7 @@ export interface WaEvent { id: number; session: string; type: string; chat: stri
 export class Core extends EventEmitter implements SessionHub {
   readonly db: Db;
   readonly repo: Repo;
+  readonly healthGuard: HealthGuard;
   readonly sessions = new Map<string, WaSession>();
   /** True when another live process already owns the WhatsApp sockets (we serve DB data only). */
   passive: { pid: number } | null = null;
@@ -35,6 +37,7 @@ export class Core extends EventEmitter implements SessionHub {
     fs.mkdirSync(path.join(cfg.dataDir, 'outbox'), { recursive: true });
     this.db = new Db(cfg.dbPath);
     this.repo = new Repo(this.db);
+    this.healthGuard = new HealthGuard(this);
   }
 
   /* ----------------------------------- startup ----------------------------------- */
@@ -97,7 +100,7 @@ export class Core extends EventEmitter implements SessionHub {
     return this.getOrCreate(name);
   }
 
-  /** Resolve the target session: explicit name, or the only/connected one. */
+  /** Resolve the target session. Explicit name required once more than one session exists. */
   resolve(name?: string): WaSession {
     if (name) {
       const s = this.sessions.get(name);
@@ -106,10 +109,9 @@ export class Core extends EventEmitter implements SessionHub {
     }
     const all = [...this.sessions.values()];
     if (all.length === 1) return all[0]!;
-    const open = all.filter((s) => s.isOpen);
-    if (open.length === 1) return open[0]!;
     if (!all.length) throw new Error('No WhatsApp session configured yet. Use session_pair {session, phone} to link a number with a pairing code.');
-    throw new Error(`Several sessions exist (${all.map((s) => s.name).join(', ')}); pass "session" explicitly.`);
+    const list = all.map((s) => `"${s.name}" (${s.isOpen ? 'connected' : s.state})`).join(', ');
+    throw new Error(`"session" is required: ${all.length} sessions exist: ${list}. Pass one of these names.`);
   }
 
   /** Same as resolve() but the session must be paired in the DB (for read-only DB queries). */
@@ -264,12 +266,28 @@ export class Core extends EventEmitter implements SessionHub {
     if (this.schedBusy || this.passive || this.cfg.readOnly) return;
     this.schedBusy = true;
     try {
-      for (const row of this.repo.dueScheduled(10)) {
+      const rows = this.repo.dueScheduled(10);
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]!;
         const s = this.sessions.get(row.session);
         if (!s?.isOpen) {
           // keep it pending for up to 1h past due, then fail it
           if (Date.now() / 1000 - row.send_at > 3600) this.repo.updateScheduled(row.id, { status: 'failed', last_error: 'session offline for more than 1h after due time' });
           continue;
+        }
+        // Health Guard check: cold contacts must respect circuit breaker
+        if (this.healthGuard.isColdRecipient(row.session, row.to_jid)) {
+          try {
+            this.healthGuard.assertCanSend(row.session, row.to_jid);
+          } catch (e) {
+            this.repo.updateScheduled(row.id, {
+              status: 'held',
+              last_error: errMsg(e),
+            });
+            this.publish(row.session, 'scheduled.held', row.to_jid, String(row.id), { scheduled_id: row.id, reason: errMsg(e) });
+            this.repo.audit('scheduled_send', row.session, row.to_jid, false, 'held: health guard circuit breaker');
+            continue;
+          }
         }
         // the conversation moved after this was scheduled: do not send blind, hold it for review
         if (this.cfg.freshnessGuard && !(JSON.parse(row.payload) as { ignore_new_messages?: boolean }).ignore_new_messages) {
@@ -288,9 +306,18 @@ export class Core extends EventEmitter implements SessionHub {
           this.repo.updateScheduled(row.id, { status: 'sent', sent_message_id: id, last_error: null });
           this.repo.audit('scheduled_send', row.session, row.to_jid, true, `#${row.id}`);
         } catch (e) {
+          const errText = errMsg(e);
+          if (errText.includes('463') || /reachout/i.test(errText)) {
+            this.healthGuard.tripCircuitBreaker(row.session, 'Protocol Error 463: Meta Reachout Timelocked detected');
+          }
           const failed = row.attempts + 1 >= 3;
-          this.repo.updateScheduled(row.id, { status: failed ? 'failed' : 'pending', last_error: errMsg(e), send_at: Math.floor(Date.now() / 1000) + 60 });
-          this.repo.audit('scheduled_send', row.session, row.to_jid, false, errMsg(e));
+          this.repo.updateScheduled(row.id, { status: failed ? 'failed' : 'pending', last_error: errText, send_at: Math.floor(Date.now() / 1000) + 60 });
+          this.repo.audit('scheduled_send', row.session, row.to_jid, false, errText);
+        }
+        // Anti-burst spacing: space out multiple messages due in the same tick
+        if (i < rows.length - 1) {
+          const gap = process.env.NODE_ENV === 'test' ? 5 : 2000;
+          await new Promise((r) => setTimeout(r, gap));
         }
       }
     } finally {

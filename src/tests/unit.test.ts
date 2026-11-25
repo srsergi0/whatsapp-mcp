@@ -22,7 +22,9 @@ test('jid helpers', () => {
 });
 
 test('fts query is escaped', () => {
-  assert.equal(ftsQuery('hola "mundo" *'), '"hola"* "mundo"*');
+  assert.equal(ftsQuery('hola'), '"hola"*');
+  assert.equal(ftsQuery('"hola mundo"'), '"hola mundo"');
+  assert.equal(ftsQuery('hola "mundo" *'), '("hola mundo") OR ("hola"* AND "mundo"*) OR ("hola"* OR "mundo"*)');
   assert.throws(() => ftsQuery('   '));
 });
 
@@ -88,6 +90,13 @@ test('repo: lid -> pn merge, upsert, fts search, cursor ordering', () => {
   repo.patchMessage('s', '5491100@s.whatsapp.net', 'm1', { text: 'cambiado', edited: true });
   assert.equal(repo.searchMessages('s', 'reunion', { limit: 5 }).length, 0, 'fts updated by trigger');
   assert.equal(repo.searchMessages('s', 'cambiado', { limit: 5 }).length, 1);
+
+  // media_name indexing and interaction search
+  repo.upsertMessage('s', { ...base, chat_jid: '5491100@s.whatsapp.net', id: 'm3', sender_jid: '5491100@s.whatsapp.net', ts: 102, text: null, media_name: 'sh_backmate_theme.zip' });
+  assert.equal(repo.searchMessages('s', 'backmate', { limit: 5 }).length, 1, 'media_name is indexed in FTS');
+
+  repo.addInteraction('s', { jid: '5491100@s.whatsapp.net', ts: 103, kind: 'call', note: 'Hablamos del plugin de facturación', status: 'done', handled: true });
+  assert.equal(repo.searchInteractions('s', 'facturacion', { limit: 5 }).length, 1, 'interactions are indexed in FTS');
 });
 
 test('assertReadablePath blocks secrets and the data dir', async () => {
@@ -136,4 +145,30 @@ test('defaultDataDir: checkout keeps <project>/data, npm/npx install uses the us
   assert.equal(defaultDataDir(npx, home), path.join(home, '.whatsapp-mcp'));
   const local = path.join(path.sep, 'proj', 'node_modules', 'whatsapp-baileys-mcp');
   assert.equal(defaultDataDir(local, home), path.join(home, '.whatsapp-mcp'));
+});
+
+test('renderDigest produces high-density token-saving summary', async () => {
+  const { renderDigest } = await import('../mcp/compact.js');
+  const msgs = [
+    { id: '1111222233334444', ts: 1700000000, type: 'document', media: { name: 'plugin.zip', size: 10485760 }, sender_name: 'Willi', from_me: false },
+    { id: '5555666677778888', ts: 1700000010, type: 'text', text: 'ahi te envie el plugin', sender_name: 'Willi', from_me: false },
+    { id: '9999000011112222', ts: 1700000020, type: 'text', text: 'recibido, ahora lo reviso', from_me: true },
+  ];
+  const notes = [
+    { id: 1, ts: 1700000025, kind: 'waiting', status: 'open', note: 'Waiting for feedback' },
+  ];
+  const lines = renderDigest(msgs, notes, { ids: true, maxChars: 100 });
+  const joined = lines.join('\n');
+  assert.ok(joined.includes('ATTACHED MEDIA & FILES'));
+  assert.ok(joined.includes('plugin.zip'));
+  assert.ok(joined.includes('OPEN TASKS & WAITING ITEMS'));
+  assert.ok(joined.includes('RECENT EXCHANGE'));
+  assert.ok(joined.includes('recibido, ahora lo reviso'));
+});
+
+test('resource uris include stream and events endpoints', async () => {
+  const { uris } = await import('../mcp/uris.js');
+  assert.equal(uris.events('TCEOS'), 'whatsapp://TCEOS/events');
+  assert.equal(uris.eventsLatest(), 'whatsapp://events/latest');
+  assert.equal(uris.chatStream('TCEOS', '123@s.whatsapp.net'), 'whatsapp://TCEOS/chat/123%40s.whatsapp.net/stream');
 });

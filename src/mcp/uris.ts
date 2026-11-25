@@ -13,6 +13,9 @@ export const uris = {
   memory: (s: string, jid: string) => `whatsapp://${enc(s)}/memory/${enc(jid)}`,
   unread: (s: string) => `whatsapp://${enc(s)}/unread`,
   inbox: (s: string) => `whatsapp://${enc(s)}/inbox`,
+  events: (s: string) => `whatsapp://${enc(s)}/events`,
+  eventsLatest: () => 'whatsapp://events/latest',
+  chatStream: (s: string, jid: string) => `whatsapp://${enc(s)}/chat/${enc(jid)}/stream`,
 };
 
 export const mediaFileUri = uris.media;

@@ -182,4 +182,46 @@ export function registerSessionTools(env: Env) {
     const s = await ctx.open(a.session);
     return { privacy: await s.socket().fetchPrivacySettings(true) };
   });
+
+  defineTool(env, 'account_health', {
+    title: 'Account health & Meta anti-ban risk audit',
+    description:
+      'Audit session health metrics against Meta\'s reverse-engineered anti-ban heuristics: risk score (0-100), cold outreach velocity, 1h/24h inbound/outbound ratios, circuit breaker status and actionable recommendations.',
+    toolset: 'sessions',
+    network: false,
+    input: { session: sessionField },
+  }, async (a, ctx) => {
+    const s = ctx.session(a.session);
+    return core.healthGuard.getReport(s.name);
+  });
+
+  defineTool(env, 'configure_health_guard', {
+    title: 'Configure anti-ban health guard and circuit breaker',
+    description:
+      'Set hourly/daily cold outreach limits, cooldown duration, or manually reset a tripped circuit breaker for a session.',
+    toolset: 'sessions',
+    effect: 'local',
+    network: false,
+    input: {
+      session: sessionField,
+      enabled: z.boolean().optional().describe('Enable or disable the health guard circuit breaker protection.'),
+      max_cold_per_hour: z.number().int().min(5).max(100).optional().describe('Maximum number of cold/new contacts allowed per hour (default 25).'),
+      max_cold_per_day: z.number().int().min(20).max(500).optional().describe('Maximum number of cold/new contacts allowed per 24 hours (default 100).'),
+      cooldown_minutes: z.number().int().min(5).max(360).optional().describe('Circuit breaker cooldown duration in minutes after being tripped (default 45).'),
+      reset_circuit_breaker: z.boolean().optional().describe('Manually reset a currently tripped circuit breaker to allow sending again immediately.'),
+    },
+  }, async (a, ctx) => {
+    const s = ctx.session(a.session);
+    if (a.reset_circuit_breaker) {
+      core.healthGuard.resetCircuitBreaker(s.name);
+    }
+    const patch: any = {};
+    if (a.enabled !== undefined) patch.enabled = a.enabled;
+    if (a.max_cold_per_hour !== undefined) patch.max_cold_per_hour = a.max_cold_per_hour;
+    if (a.max_cold_per_day !== undefined) patch.max_cold_per_day = a.max_cold_per_day;
+    if (a.cooldown_minutes !== undefined) patch.cooldown_minutes = a.cooldown_minutes;
+    const config = core.healthGuard.updateConfig(s.name, patch);
+    const cb = core.healthGuard.getCircuitBreakerState(s.name);
+    return { session: s.name, config, circuit_breaker: cb };
+  });
 }

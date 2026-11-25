@@ -101,6 +101,44 @@ export function renderTranscript(messages: any[], notes: any[], o: RenderOpts): 
   return lines;
 }
 
+/** High-density executive digest of a chat: key files, pending notes, and recent exchange (~80% token savings). */
+export function renderDigest(messages: any[], notes: any[], o: RenderOpts): string[] {
+  const lines: string[] = [];
+  if (!messages.length && !notes.length) return ['(no messages or notes)'];
+
+  // 1. Files & Documents
+  const mediaMsgs = messages.filter((m) => m.media || ['image', 'video', 'audio', 'voice', 'document', 'sticker'].includes(m.type));
+  if (mediaMsgs.length) {
+    lines.push(`📎 ATTACHED MEDIA & FILES (${mediaMsgs.length})`);
+    for (const m of mediaMsgs.slice(-10)) {
+      const who = m.from_me ? 'me' : (m.sender_name ?? m.sender ?? '?');
+      const med = m.media ?? {};
+      const desc = med.name ? `${med.name} (${kb(med.size) || m.type})` : `[${m.type} ${kb(med.size)}]`;
+      lines.push(`  • [${localShort(m.ts)}] ${who}: ${desc}${o.ids ? ' ' + shortId(m.id) : ''}`);
+    }
+  }
+
+  // 2. Pending Notes, Waiting items, Open Tasks
+  const openNotes = notes.filter((n) => n.status === 'open' || n.kind === 'waiting' || n.due);
+  if (openNotes.length) {
+    lines.push(`★ OPEN TASKS & WAITING ITEMS (${openNotes.length})`);
+    for (const n of openNotes) {
+      lines.push(`  • ★ ${String(n.kind).toUpperCase()}${n.status === 'open' ? ' [OPEN]' : ''}: ${clip(n.note, o.maxChars || 160)} {n${n.id}}`);
+    }
+  }
+
+  // 3. Recent Messages (last 6 messages for immediate conversational context)
+  const recent = messages.slice(-6);
+  if (recent.length) {
+    lines.push(`💬 RECENT EXCHANGE (last ${recent.length} msgs)`);
+    for (const m of recent) {
+      lines.push('  ' + renderMessage(m, o, localShort));
+    }
+  }
+
+  return lines;
+}
+
 export function chatHeader(name: string | null | undefined, jid: string, extra = ''): string {
   return `# ${name ? name + ' ' : ''}<${jid}>${extra ? ' · ' + extra : ''} · times ${TZ}`;
 }

@@ -61,11 +61,24 @@ export function decodeCursor(c?: string): string[] | undefined {
   }
 }
 
-/** Escape user input into a safe FTS5 query: every word becomes a quoted prefix term (AND). */
+/** Escape user input into a safe FTS5 query: phrase boost + multi-term AND + partial term OR. */
 export function ftsQuery(q: string): string {
-  const terms = q.split(/\s+/).map((t) => t.replace(/["*^():]/g, '')).filter(Boolean);
+  const clean = q.trim();
+  if (!clean) throw new Error('Empty search query');
+  if (/^".+"$/.test(clean)) {
+    const inner = clean.slice(1, -1).replace(/["*^():]/g, '').trim();
+    if (!inner) throw new Error('Empty search query');
+    return `"${inner}"`;
+  }
+  const terms = clean.split(/\s+/).map((t) => t.replace(/["*^():]/g, '')).filter(Boolean);
   if (!terms.length) throw new Error('Empty search query');
-  return terms.map((t) => `"${t}"*`).join(' ');
+  if (terms.length === 1) {
+    return `"${terms[0]}"*`;
+  }
+  const phrase = `"${terms.join(' ')}"`;
+  const andTerms = terms.map((t) => `"${t}"*`).join(' AND ');
+  const orTerms = terms.map((t) => `"${t}"*`).join(' OR ');
+  return `(${phrase}) OR (${andTerms}) OR (${orTerms})`;
 }
 
 export class Repo {
@@ -375,8 +388,8 @@ export class Repo {
   }
 
   searchMessages(session: string, q: string, f: {
-    chat?: string; fromMe?: boolean; sender?: string; type?: string; since?: number; until?: number; limit: number; offset?: number;
-  }): (MessageRow & { snippet: string })[] {
+    chat?: string; fromMe?: boolean; sender?: string; type?: string; since?: number; until?: number; limit: number; offset?: number; sortBy?: 'relevance' | 'recent';
+  }): (MessageRow & { snippet: string; score?: number })[] {
     const where = ['messages_fts MATCH ?', 'm.session = ?'];
     const args: Param[] = [ftsQuery(q), session];
     if (f.chat) { where.push('m.chat_jid = ?'); args.push(f.chat); }
@@ -385,10 +398,30 @@ export class Repo {
     if (f.type) { where.push('m.type = ?'); args.push(f.type); }
     if (f.since !== undefined) { where.push('m.ts >= ?'); args.push(f.since); }
     if (f.until !== undefined) { where.push('m.ts <= ?'); args.push(f.until); }
+
+    // BM25 weights: text: 5.0, caption: 3.0, sender_name: 1.0, media_name: 6.0
+    const orderBy = f.sortBy === 'recent'
+      ? 'm.ts DESC'
+      : 'bm25(messages_fts, 5.0, 3.0, 1.0, 6.0) ASC, m.ts DESC';
+
     return this.db.all(
-      `SELECT ${MSG_COLS}, snippet(messages_fts, -1, '[', ']', '…', 12) AS snippet
+      `SELECT ${MSG_COLS}, snippet(messages_fts, -1, '[', ']', '…', 12) AS snippet,
+              bm25(messages_fts, 5.0, 3.0, 1.0, 6.0) AS score
        FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
-       WHERE ${where.join(' AND ')} ORDER BY m.ts DESC LIMIT ? OFFSET ?`, ...args, f.limit, f.offset ?? 0) as (MessageRow & { snippet: string })[];
+       WHERE ${where.join(' AND ')} ORDER BY ${orderBy} LIMIT ? OFFSET ?`, ...args, f.limit, f.offset ?? 0) as (MessageRow & { snippet: string; score?: number })[];
+  }
+
+  searchInteractions(session: string, q: string, f: {
+    jid?: string; limit: number;
+  }): (InteractionRow & { snippet: string })[] {
+    const where = ['interactions_fts MATCH ?', 'i.session = ?'];
+    const args: Param[] = [ftsQuery(q), session];
+    if (f.jid) { where.push('i.jid = ?'); args.push(f.jid); }
+    return this.db.all(
+      `SELECT i.*, snippet(interactions_fts, -1, '[', ']', '…', 12) AS snippet
+       FROM interactions_fts JOIN interactions i ON i.id = interactions_fts.rowid
+       WHERE ${where.join(' AND ')} ORDER BY bm25(interactions_fts, 4.0, 2.0) ASC, i.ts DESC LIMIT ?`,
+      ...args, f.limit) as (InteractionRow & { snippet: string })[];
   }
 
   patchMessage(session: string, chat: string, id: string, patch: Partial<{
@@ -656,12 +689,21 @@ export class Repo {
   dueScheduled(limit = 20): ScheduledRow[] {
     return this.db.all<ScheduledRow>("SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_at <= ? ORDER BY send_at LIMIT ?", now(), limit);
   }
-  listScheduled(session?: string, status?: string, limit = 100): ScheduledRow[] {
+  listScheduled(session?: string, status?: string, limit = 100, filter?: { broadcastId?: string; tag?: string }): ScheduledRow[] {
     const where: string[] = [];
     const args: Param[] = [];
     if (session) { where.push('session = ?'); args.push(session); }
     if (status) { where.push('status = ?'); args.push(status); }
-    return this.db.all<ScheduledRow>(`SELECT * FROM scheduled_messages ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY send_at DESC LIMIT ?`, ...args, limit);
+    const rows = this.db.all<ScheduledRow>(`SELECT * FROM scheduled_messages ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY send_at DESC LIMIT ?`, ...args, filter?.broadcastId || filter?.tag ? limit * 3 : limit);
+    if (!filter?.broadcastId && !filter?.tag) return rows.slice(0, limit);
+    return rows.filter((r) => {
+      try {
+        const p = JSON.parse(r.payload);
+        if (filter.broadcastId && p.broadcast_id !== filter.broadcastId) return false;
+        if (filter.tag && p.tag !== filter.tag) return false;
+        return true;
+      } catch { return false; }
+    }).slice(0, limit);
   }
   getScheduled(id: number) {
     return this.db.get<ScheduledRow>('SELECT * FROM scheduled_messages WHERE id = ?', id);
@@ -669,6 +711,26 @@ export class Repo {
   updateScheduled(id: number, patch: Partial<Pick<ScheduledRow, 'status' | 'attempts' | 'last_error' | 'sent_message_id' | 'send_at' | 'payload'>>) {
     const keys = Object.keys(patch) as (keyof typeof patch)[];
     this.db.run(`UPDATE scheduled_messages SET ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = ? WHERE id = ?`, ...keys.map((k) => patch[k] as Param), now(), id);
+  }
+  cancelScheduledGroup(session?: string, filter?: { broadcastId?: string; tag?: string }): number {
+    const where = ["status IN ('pending', 'held')"];
+    const args: Param[] = [];
+    if (session) { where.push('session = ?'); args.push(session); }
+    const rows = this.db.all<ScheduledRow>(`SELECT id, payload FROM scheduled_messages WHERE ${where.join(' AND ')}`, ...args);
+    let cancelled = 0;
+    const nowTs = now();
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(row.payload);
+        const matchBroadcast = filter?.broadcastId && payload.broadcast_id === filter.broadcastId;
+        const matchTag = filter?.tag && payload.tag === filter.tag;
+        if (matchBroadcast || matchTag) {
+          this.db.run("UPDATE scheduled_messages SET status = 'cancelled', updated_at = ? WHERE id = ?", nowTs, row.id);
+          cancelled++;
+        }
+      } catch { /* ignore invalid json */ }
+    }
+    return cancelled;
   }
 
   /* --------------------------------- events -------------------------------- */

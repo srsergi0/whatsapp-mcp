@@ -1,11 +1,12 @@
 import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { z } from 'zod';
 import type { ContentBlock } from '@modelcontextprotocol/sdk/types.js';
 import { decodeCursor, encodeCursor } from '../../db/repo.js';
 import { iso, sleep } from '../../util.js';
 import { downloadStoredMedia } from '../../wa/ingest.js';
 import { markSeen, readCursor } from '../freshness.js';
-import { chatHeader, renderFollowUps, renderInbox, renderMessage, renderTranscript, localShort, TZ } from '../compact.js';
+import { chatHeader, renderDigest, renderFollowUps, renderInbox, renderMessage, renderTranscript, localShort, shortId, TZ } from '../compact.js';
 import { DISMISS_KEY, NO_FOLLOWUP_TAGS, computeFollowUps, computeInbox } from '../inbox.js';
 import { compact } from '../present.js';
 import { uris } from '../uris.js';
@@ -32,7 +33,7 @@ export function registerReadTools(env: Env) {
   const { core } = env;
 
   const fmt = {
-    format: z.enum(['compact', 'json']).default('compact').describe('compact = readable transcript text (about 5x fewer tokens, default); json = full structured data.'),
+    format: z.enum(['compact', 'json', 'digest']).default('compact').describe('compact = readable transcript text (about 5x fewer tokens, default); json = full structured data; digest = high-density executive digest of key files, pending notes, and recent exchange (~80% token savings).'),
     max_chars: z.number().int().min(0).max(20000).default(600).describe('Cut each message text after this many characters (0 = no limit). Full text via get_message.'),
     ids: z.boolean().default(true).describe('Print a short "#id" after each message so other tools can reference it (react, quote, edit, download...).'),
   };
@@ -163,12 +164,18 @@ export function registerReadTools(env: Env) {
     if (a.format === 'json') {
       return {
         session: s.name, chat: jid, chat_name: name, count: rows.length, new_since_last_read: incremental ? rows.length : undefined,
-        messages: msgs, my_notes: notes, next_cursor: nextCursor, note: emptyNote ?? (firstRead ? 'First read of this chat by this client: returned the latest messages.' : hasMoreNew ? 'More new messages exist; call again with unseen_only.' : undefined),
+        messages: msgs.map((m: any) => ({ short_id: shortId(m.id), ...m })), my_notes: notes, next_cursor: nextCursor, note: emptyNote ?? (firstRead ? 'First read of this chat by this client: returned the latest messages.' : hasMoreNew ? 'More new messages exist; call again with unseen_only.' : undefined),
       };
     }
     const o = { ids: a.ids, maxChars: a.max_chars };
     const anchorLabel = a.after_message_id ? (a.after_message_id.startsWith('#') ? a.after_message_id : `#${a.after_message_id.slice(-8)}`) : '';
     const head = chatHeader(name, jid, a.after_message_id ? `${rows.length} after ${anchorLabel}` : incremental ? `${rows.length} new since last read` : `${rows.length} msgs`);
+    if (a.format === 'digest') {
+      const lines = [head, ...(rows.length ? renderDigest(msgs as any[], notes as any[], o) : [])];
+      if (emptyNote) lines.push(emptyNote);
+      if (nextCursor) lines.push(`… older messages: cursor=${nextCursor}`);
+      return new TextResult(lines.join('\n'), { session: s.name, chat: jid, chat_name: name, count: rows.length, new_since_last_read: incremental ? rows.length : undefined, next_cursor: nextCursor });
+    }
     const lines = [head, ...(rows.length ? renderTranscript(msgs as any[], notes as any[], o) : [])];
     if (emptyNote) lines.push(emptyNote);
     if (firstRead) lines.push('(first read of this chat by this client: latest messages)');
@@ -205,8 +212,8 @@ export function registerReadTools(env: Env) {
   });
 
   defineTool(env, 'search_messages', {
-    title: 'Search messages (full text)',
-    description: 'Full-text search (FTS5, accent-insensitive, prefix matching, all words must match) over text, captions and sender names across all chats or one chat.',
+    title: 'Search messages (full text & BM25)',
+    description: 'Full-text search powered by BM25 relevance ranking and smart phrase matching. Searches across text, captions, sender names, attachment filenames (media_name), and logged interactions (calls, notes, tasks).',
     toolset: 'read',
     input: {
       session: sessionField,
@@ -219,32 +226,45 @@ export function registerReadTools(env: Env) {
       until: z.string().optional().describe(timeDesc),
       limit: limitField(20, 100),
       offset: z.number().int().min(0).default(0),
+      sort_by: z.enum(['relevance', 'recent']).default('relevance').describe('relevance = BM25 ranked (most relevant first, default); recent = date descending.'),
+      include_notes: z.boolean().default(true).describe('Also search notes, logged calls and tasks.'),
       ...fmt,
     },
     network: false,
   }, async (a, ctx) => {
     const s = ctx.session(a.session);
+    const chatJid = a.chat ? ctx.chat(s.name, a.chat) : undefined;
     const rows = core.repo.searchMessages(s.name, a.query, {
-      chat: a.chat ? ctx.chat(s.name, a.chat) : undefined, fromMe: a.from_me, sender: a.sender ? ctx.jid(s.name, a.sender) : undefined, type: a.type,
-      since: parseTime(a.since), until: parseTime(a.until), limit: a.limit, offset: a.offset,
+      chat: chatJid, fromMe: a.from_me, sender: a.sender ? ctx.jid(s.name, a.sender) : undefined, type: a.type,
+      since: parseTime(a.since), until: parseTime(a.until), limit: a.limit, offset: a.offset, sortBy: a.sort_by,
     });
+    const matchingNotes = a.include_notes
+      ? core.repo.searchInteractions(s.name, a.query, { jid: chatJid, limit: 10 })
+      : [];
     const p = ctx.presenter(s.name);
     const nextOffset = rows.length === a.limit ? a.offset + rows.length : undefined;
     if (a.format === 'json') {
       return {
         session: s.name, count: rows.length,
-        results: rows.map((r) => ({ ...p.message(r), chat_name: p.name(r.chat_jid) ?? undefined, match: r.snippet })),
+        results: rows.map((r) => ({ ...p.message(r), chat_name: p.name(r.chat_jid) ?? undefined, match: r.snippet, score: r.score })),
+        notes: matchingNotes.map((n) => ({ ...p.interaction(n), match: n.snippet })),
         next_offset: nextOffset,
       };
     }
     const o = { ids: a.ids, maxChars: a.max_chars };
-    const lines = [`SEARCH "${a.query}" · ${rows.length} result(s) · times ${TZ}`];
+    const lines = [`SEARCH "${a.query}" · ${rows.length} message(s)${matchingNotes.length ? ` · ${matchingNotes.length} note(s)` : ''} · times ${TZ}`];
     for (const r of rows) {
       const m = p.message(r) as any;
       lines.push(renderMessage(m, o, localShort, `${p.name(r.chat_jid) ?? r.chat_jid} <${r.chat_jid}>`));
     }
+    if (matchingNotes.length) {
+      lines.push(`\n★ MATCHING NOTES & CALLS (${matchingNotes.length})`);
+      for (const n of matchingNotes) {
+        lines.push(`  • [${localShort(n.ts)}] ${p.name(n.jid) ?? n.jid} ★ ${String(n.kind).toUpperCase()}: ${n.snippet} {n${n.id}}`);
+      }
+    }
     if (nextOffset) lines.push(`… more: offset=${nextOffset}`);
-    return new TextResult(lines.join('\n'), { session: s.name, count: rows.length, next_offset: nextOffset });
+    return new TextResult(lines.join('\n'), { session: s.name, count: rows.length, notes_count: matchingNotes.length, next_offset: nextOffset });
   });
 
   defineTool(env, 'inbox', {
@@ -381,18 +401,54 @@ export function registerReadTools(env: Env) {
 
   defineTool(env, 'download_media', {
     title: 'Download media of a message',
-    description: 'Download (and cache on disk) the image/video/audio/document/sticker of a message. Images are returned inline so you can look at them; everything else comes back as a resource link plus the local file path.',
+    description: 'Download (and cache on disk) the image/video/audio/document/sticker of a message. Images are returned inline so you can look at them; everything else comes back as a resource link plus the local file path. Optionally copies directly to destination_dir or destination_file.',
     toolset: 'read',
     effect: 'local',
     idempotent: true,
     network: true,
-    input: { session: sessionField, chat: chatField, message_id: z.string(), inline: z.boolean().default(true).describe('Embed images/audio (≤ 2 MB) in the response.') },
+    input: {
+      session: sessionField,
+      chat: chatField,
+      message_id: z.string(),
+      inline: z.boolean().default(true).describe('Embed images/audio (≤ 2 MB) in the response.'),
+      destination_dir: z.string().optional().describe('Optional directory path to copy/save the file to (e.g. "./addons" or full workspace folder).'),
+      destination_file: z.string().optional().describe('Optional target file path to save the downloaded file as.'),
+    },
   }, async (a, ctx) => {
     const s = await ctx.open(a.session);
     const chat = ctx.chat(s.name, a.chat);
     const r = await downloadStoredMedia(s, core, chat, a.message_id);
     const row = core.repo.getMessage(s.name, chat, a.message_id)!;
-    const data = { chat, message_id: a.message_id, path: r.path, mime: r.mime, size: r.size, name: row.media_name ?? undefined, uri: uris.media(s.name, chat, a.message_id) };
+
+    let savedTo: string | undefined;
+    if (a.destination_file || a.destination_dir) {
+      const DENY_SEGMENTS = ['.ssh', '.gnupg', '.aws', '.azure', '.kube', '.docker', '.git'];
+      let target: string;
+      if (a.destination_file) {
+        target = path.resolve(a.destination_file);
+      } else {
+        const outName = row.media_name || path.basename(r.path);
+        target = path.join(path.resolve(a.destination_dir!), outName);
+      }
+      const parts = target.split(path.sep).map((p) => p.toLowerCase());
+      if (DENY_SEGMENTS.some((d) => parts.includes(d))) {
+        throw new Error(`Refusing to write to protected directory: ${target}`);
+      }
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await fsp.copyFile(r.path, target);
+      savedTo = target;
+    }
+
+    const data = {
+      chat,
+      message_id: a.message_id,
+      path: r.path,
+      saved_to: savedTo,
+      mime: r.mime,
+      size: r.size,
+      name: row.media_name ?? undefined,
+      uri: uris.media(s.name, chat, a.message_id),
+    };
     const content: ContentBlock[] = [];
     if (a.inline && r.size <= 2 * 1024 * 1024 && r.mime) {
       const b64 = (await fsp.readFile(r.path)).toString('base64');

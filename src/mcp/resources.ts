@@ -200,4 +200,50 @@ export function registerResources(server: McpServer, core: Core) {
       return { contents: [{ uri: uri.href, mimeType: r.mime?.split(';')[0] ?? 'application/octet-stream', blob: buf.toString('base64') }] };
     },
   );
+
+  server.registerResource(
+    'events-latest',
+    uris.eventsLatest(),
+    { title: 'Latest WhatsApp events', description: 'Stream of latest 50 WhatsApp events across all sessions (subscribe for live push).', mimeType: 'application/json' },
+    async (uri) => json(uri.href, { events: core.repo.listEvents({ sinceId: Math.max(0, core.repo.lastEventId() - 50), limit: 50 }).map((e) => ({ ...e, time: iso(e.ts) })) }),
+  );
+
+  server.registerResource(
+    'session-events',
+    new ResourceTemplate('whatsapp://{session}/events', {
+      list: async () => ({ resources: sessionNames().map((s) => ({ uri: uris.events(s), name: `events:${s}`, mimeType: 'application/json' })) }),
+      complete: sessionComplete,
+    }),
+    { title: 'Session events feed', description: 'Recent events feed for a specific session. Subscribe to be notified on incoming events.', mimeType: 'application/json' },
+    async (uri, v) => {
+      const s = core.resolve(dec(v.session));
+      return json(uri.href, { session: s.name, events: core.repo.listEvents({ session: s.name, sinceId: Math.max(0, core.repo.lastEventId() - 50), limit: 50 }).map((e) => ({ ...e, time: iso(e.ts) })) });
+    },
+  );
+
+  server.registerResource(
+    'chat-stream',
+    new ResourceTemplate('whatsapp://{session}/chat/{jid}/stream', {
+      list: async () => ({
+        resources: sessionNames().flatMap((s) =>
+          core.repo.listChats(s, { limit: 15 }).rows.map((c) => ({
+            uri: uris.chatStream(s, c.jid), name: `stream:${c.jid}`, description: 'Live updating transcript stream of this chat', mimeType: 'text/markdown',
+          }))
+        ),
+      }),
+      complete: {
+        ...sessionComplete,
+        jid: async (v: string, ctx?: any) => {
+          const s = ctx?.arguments?.session ? dec(ctx.arguments.session) : sessionNames()[0];
+          if (!s) return [];
+          return core.repo.listChats(s, { query: v || undefined, limit: 20 }).rows.map((c) => c.jid);
+        },
+      },
+    }),
+    { title: 'Live chat transcript stream', description: 'Real-time updated transcript stream of a chat. Notified via resources/updated when new messages arrive.', mimeType: 'text/markdown' },
+    async (uri, v) => {
+      const s = core.resolve(dec(v.session));
+      return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text: transcript(core, s.name, dec(v.jid), 30, server) }] };
+    },
+  );
 }

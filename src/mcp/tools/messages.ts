@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { iso, parseMoment } from '../../util.js';
-import { toJid } from '../../wa/jid.js';
+import { errMsg, iso, parseMoment } from '../../util.js';
+import { bare, phoneOf, toJid } from '../../wa/jid.js';
 import { assertReadablePath } from '../../wa/media.js';
 import {
   editText, forwardMessage, pinMessage, reactTo, revokeMessage, sendContacts, sendEvent, sendLocation, sendMedia, sendPoll, sendText,
@@ -30,6 +30,24 @@ export function sentResult(ctx: Ctx, session: string, r: SentInfo) {
   return { id: r.id, chat: r.chat, time: iso(r.ts)!, ts: r.ts, type: r.type, to_name: ctx.presenter(session).name(r.chat) ?? undefined };
 }
 
+export function interpolateTemplate(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) => {
+    return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key]! : match;
+  });
+}
+
+export function formatDuration(seconds: number): string {
+  if (seconds <= 0) return '0s';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const parts: string[] = [];
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  if (s > 0 || parts.length === 0) parts.push(`${s}s`);
+  return parts.join(' ');
+}
+
 export function registerMessageTools(env: Env) {
   const { core } = env;
 
@@ -52,6 +70,7 @@ export function registerMessageTools(env: Env) {
   const prep = async (ctx: Ctx, sessionName: string | undefined, to: string, ignoreNew?: boolean) => {
     const s = await ctx.openForWrite(sessionName);
     const jid = ctx.recipient(s.name, to);
+    core.healthGuard.assertCanSend(s.name, jid);
     const guard = ignoreNew ? undefined : () => assertFresh(core, ctx.server, s.name, jid);
     await guard?.();
     return { s, jid, guard };
@@ -212,6 +231,7 @@ export function registerMessageTools(env: Env) {
   }, async (a, ctx) => {
     const s = await ctx.openForWrite(a.session);
     const dest = ctx.recipient(s.name, a.to);
+    core.healthGuard.assertCanSend(s.name, dest);
     assertFresh(core, ctx.server, s.name, dest);
     return sentResult(ctx, s.name, await forwardMessage(core, s, ctx.chat(s.name, a.from_chat), a.message_id, dest));
   });
@@ -321,34 +341,332 @@ export function registerMessageTools(env: Env) {
     return { scheduled_id: id, to: jid, send_at: iso(when) };
   });
 
+  const broadcastDef = {
+    title: 'Safe broadcast with anti-ban jitter',
+    description:
+      'Queue personalized messages to multiple recipients with randomized anti-ban jitter intervals, batch cool-down pauses, dynamic contact variables ({{name}}, {{first_name}}, {{phone}}, and custom variables), and SQLite persistence. Supports dry_run preview.',
+    toolset: 'messages' as const,
+    effect: 'local' as const,
+    input: {
+      session: sessionField,
+      recipients: z.array(z.string().min(1)).min(1).max(1000).describe('List of recipients: phone numbers with country code (e.g. 51912345678), full jids, or exact contact names.'),
+      message: z.string().min(1).max(60000).describe('Message template. Placeholders: {{name}}, {{first_name}}, {{phone}}, and custom keys from variables.'),
+      variables: z.record(z.string(), z.record(z.string(), z.string())).optional().describe('Per-recipient custom variables: { "<phone_or_name>": { "code": "A12", "amount": "100" } }'),
+      media: z.object({
+        kind: z.enum(['image', 'video', 'audio', 'voice', 'document']),
+        path: z.string().optional(),
+        url: z.string().optional(),
+        file_name: z.string().optional(),
+        caption: z.string().optional().describe('Optional caption template (supports {{name}} etc.).'),
+      }).optional().describe('Optional media file to broadcast.'),
+      min_delay_seconds: z.number().int().min(5).max(600).default(15).describe('Minimum anti-ban delay between consecutive messages in seconds (default: 15).'),
+      max_delay_seconds: z.number().int().min(5).max(1800).default(35).describe('Maximum anti-ban delay between consecutive messages in seconds (default: 35).'),
+      batch_size: z.number().int().min(1).max(100).default(5).describe('Number of messages to send before triggering a cool-down pause (default: 5).'),
+      cooldown_seconds: z.number().int().min(10).max(3600).default(60).describe('Cool-down pause duration after each batch in seconds (default: 60).'),
+      start_at: z.string().optional().describe('Scheduled start date/time (ISO-8601 or relative "+10m", "+1h"). Defaults to starting now + first jitter.'),
+      typing_ms: z.number().int().min(0).max(15000).default(2000).optional().describe('Show "typing..." presence before each message is sent (human emulation, default 2000ms).'),
+      ignore_new_messages: z.boolean().default(false).optional().describe('If true, send scheduled messages even if recipient sends an incoming message in the meantime.'),
+      tag: z.string().max(60).optional().describe('Campaign tag or identifier to group and track this broadcast (e.g. "promo-navidad").'),
+      dry_run: z.boolean().default(false).describe('If true, simulate resolution, templating, and anti-ban timeline without scheduling messages.'),
+    },
+  };
+
+  const broadcastHandler = async (a: any, ctx: Ctx) => {
+    const s = ctx.session(a.session);
+    if (a.media?.path) {
+      assertReadablePath(a.media.path, core.cfg);
+    }
+    const minDelay = Math.min(a.min_delay_seconds, a.max_delay_seconds);
+    const maxDelay = Math.max(a.min_delay_seconds, a.max_delay_seconds);
+    const batchSize = Math.max(1, a.batch_size);
+    const cooldownSec = Math.max(0, a.cooldown_seconds);
+
+    const resolved: Array<{
+      raw: string;
+      jid: string;
+      phone: string;
+      name: string;
+      firstName: string;
+      text: string;
+      caption?: string;
+    }> = [];
+    const invalid: Array<{ recipient: string; error: string }> = [];
+    const duplicates: string[] = [];
+    const warnings: string[] = [];
+    const seenJids = new Set<string>();
+
+    for (const r of a.recipients) {
+      const trimmed = String(r).trim();
+      if (!trimmed) continue;
+      let jid: string;
+      try {
+        jid = ctx.recipient(s.name, trimmed);
+      } catch (err) {
+        try {
+          const cleaned = trimmed.replace(/[^\d+]/g, '');
+          if (cleaned.length >= 7) {
+            jid = ctx.jid(s.name, cleaned);
+          } else {
+            invalid.push({ recipient: trimmed, error: errMsg(err) });
+            continue;
+          }
+        } catch {
+          invalid.push({ recipient: trimmed, error: errMsg(err) });
+          continue;
+        }
+      }
+
+      if (seenJids.has(jid)) {
+        duplicates.push(trimmed);
+        continue;
+      }
+      seenJids.add(jid);
+
+      const contact = core.repo.getContact(s.name, jid);
+      const chat = core.repo.getChat(s.name, jid);
+      const phone = phoneOf(jid) ?? bare(jid);
+      const contactName = (contact?.name || contact?.notify || contact?.verified_name || chat?.display_name || '').trim();
+      const firstName = contactName ? contactName.split(/\s+/)[0]! : '';
+
+      const customVars = a.variables?.[trimmed] ?? a.variables?.[phone] ?? a.variables?.[jid] ?? {};
+      const vars: Record<string, string> = {
+        name: contactName || 'Cliente',
+        first_name: firstName || 'Cliente',
+        phone,
+        ...customVars,
+      };
+
+      const personalizedText = interpolateTemplate(a.message, vars);
+      const personalizedCaption = a.media?.caption ? interpolateTemplate(a.media.caption, vars) : undefined;
+
+      const remaining = personalizedText.match(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g);
+      if (remaining) {
+        for (const rem of remaining) {
+          const key = rem.replace(/[{}]/g, '').trim();
+          warnings.push(`Recipient "${contactName || phone}": variable {{${key}}} not provided`);
+        }
+      }
+      if (personalizedCaption) {
+        const remainingCap = personalizedCaption.match(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g);
+        if (remainingCap) {
+          for (const rem of remainingCap) {
+            const key = rem.replace(/[{}]/g, '').trim();
+            warnings.push(`Recipient "${contactName || phone}" caption: variable {{${key}}} not provided`);
+          }
+        }
+      }
+
+      resolved.push({
+        raw: trimmed,
+        jid,
+        phone,
+        name: contactName || 'Cliente',
+        firstName: firstName || 'Cliente',
+        text: personalizedText,
+        caption: personalizedCaption,
+      });
+    }
+
+    if (!resolved.length) {
+      throw new Error(`No valid recipients could be resolved: ${JSON.stringify(invalid)}`);
+    }
+
+    const capacity = core.healthGuard.checkBroadcastCapacity(s.name, resolved.length);
+    if (!capacity.safe && capacity.warning) {
+      warnings.push(`Health Guard: ${capacity.warning}`);
+    }
+
+    if (!a.dry_run) {
+      const cb = core.healthGuard.getCircuitBreakerState(s.name);
+      if (cb.tripped) {
+        const hasCold = resolved.some((r) => core.healthGuard.isColdRecipient(s.name, r.jid));
+        if (hasCold) {
+          throw new Error(`CIRCUIT BREAKER ACTIVE [Meta Ban Protection]: Cannot schedule broadcast to cold recipients while circuit breaker is tripped (${cb.reason ?? 'High risk score'}).`);
+        }
+      }
+    }
+
+    let currentSendAt = a.start_at ? parseMoment(a.start_at, 'future') : Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(currentSendAt) || currentSendAt < Math.floor(Date.now() / 1000) - 30) {
+      currentSendAt = Math.floor(Date.now() / 1000);
+    }
+
+    const broadcastId = `bcast_${Math.floor(Date.now() / 1000)}_${Math.random().toString(36).slice(2, 7)}`;
+    const timeline = [];
+
+    for (let i = 0; i < resolved.length; i++) {
+      const item = resolved[i]!;
+      const jitter = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+      const isCooldown = (i > 0 && i % batchSize === 0);
+      const delay = (i === 0) ? jitter : (isCooldown ? (cooldownSec + jitter) : jitter);
+      currentSendAt += delay;
+
+      timeline.push({
+        index: i + 1,
+        recipient: item.raw,
+        jid: item.jid,
+        phone: item.phone,
+        name: item.name,
+        send_at: currentSendAt,
+        send_at_iso: iso(currentSendAt)!,
+        delay_seconds: delay,
+        is_cooldown: isCooldown,
+        text: item.text,
+        caption: item.caption,
+      });
+    }
+
+    const totalSeconds = timeline.length ? (timeline[timeline.length - 1]!.send_at - Math.floor(Date.now() / 1000)) : 0;
+
+    if (a.dry_run) {
+      return {
+        dry_run: true,
+        broadcast_id: broadcastId,
+        tag: a.tag ?? null,
+        summary: {
+          total_recipients: a.recipients.length,
+          valid_recipients: resolved.length,
+          invalid_recipients: invalid.length,
+          duplicates_skipped: duplicates.length,
+          batch_size: batchSize,
+          batch_count: Math.ceil(resolved.length / batchSize),
+          min_delay_seconds: minDelay,
+          max_delay_seconds: maxDelay,
+          cooldown_seconds: cooldownSec,
+          estimated_duration: formatDuration(totalSeconds),
+          estimated_total_seconds: totalSeconds,
+          first_send_at: timeline[0]?.send_at_iso ?? null,
+          last_send_at: timeline[timeline.length - 1]?.send_at_iso ?? null,
+        },
+        warnings: [...new Set(warnings)].slice(0, 50),
+        invalid_recipients: invalid,
+        duplicates,
+        timeline_preview: timeline.slice(0, 20).map((t) => ({
+          index: t.index,
+          to: t.jid,
+          name: t.name,
+          send_at: t.send_at_iso,
+          delay_seconds: t.delay_seconds,
+          is_cooldown: t.is_cooldown,
+          preview: t.text.slice(0, 100),
+        })),
+      };
+    }
+
+    const queued: Array<{ scheduled_id: number; to: string; name: string; send_at: string; delay_seconds: number }> = [];
+    for (const t of timeline) {
+      let kind: 'text' | 'media';
+      let payload: any;
+      if (a.media) {
+        kind = 'media';
+        payload = {
+          ...a.media,
+          caption: t.caption ?? t.text,
+          broadcast_id: broadcastId,
+          broadcast_index: t.index,
+          broadcast_total: timeline.length,
+          tag: a.tag ?? null,
+          typing_ms: a.typing_ms ?? 2000,
+          ignore_new_messages: a.ignore_new_messages ?? false,
+        };
+      } else {
+        kind = 'text';
+        payload = {
+          text: t.text,
+          broadcast_id: broadcastId,
+          broadcast_index: t.index,
+          broadcast_total: timeline.length,
+          tag: a.tag ?? null,
+          typing_ms: a.typing_ms ?? 2000,
+          ignore_new_messages: a.ignore_new_messages ?? false,
+        };
+      }
+
+      const id = core.repo.schedule(s.name, t.jid, kind, payload, t.send_at);
+      queued.push({
+        scheduled_id: id,
+        to: t.jid,
+        name: t.name,
+        send_at: t.send_at_iso,
+        delay_seconds: t.delay_seconds,
+      });
+    }
+
+    return {
+      broadcast_id: broadcastId,
+      tag: a.tag ?? null,
+      scheduled_count: queued.length,
+      invalid_count: invalid.length,
+      summary: {
+        total_recipients: a.recipients.length,
+        valid_recipients: resolved.length,
+        batch_size: batchSize,
+        batch_count: Math.ceil(resolved.length / batchSize),
+        estimated_duration: formatDuration(totalSeconds),
+        estimated_total_seconds: totalSeconds,
+        first_send_at: timeline[0]?.send_at_iso ?? null,
+        last_send_at: timeline[timeline.length - 1]?.send_at_iso ?? null,
+      },
+      warnings: [...new Set(warnings)].slice(0, 50),
+      invalid_recipients: invalid,
+      duplicates,
+      queued_messages: queued.slice(0, 50),
+    };
+  };
+
+  defineTool(env, 'broadcast_message', broadcastDef as any, broadcastHandler);
+  defineTool(env, 'broadcast', broadcastDef as any, broadcastHandler);
+
   defineTool(env, 'list_scheduled', {
     title: 'List scheduled messages',
     description: 'Show queued / sent / failed scheduled messages.',
     toolset: 'messages',
-    input: { session: sessionField, status: z.enum(['pending', 'held', 'sent', 'failed', 'cancelled']).optional(), limit: z.number().int().min(1).max(200).default(50) },
+    input: {
+      session: sessionField,
+      status: z.enum(['pending', 'held', 'sent', 'failed', 'cancelled']).optional(),
+      limit: z.number().int().min(1).max(200).default(50),
+      broadcast_id: z.string().optional().describe('Filter by broadcast ID.'),
+      tag: z.string().optional().describe('Filter by campaign tag.'),
+    },
     network: false,
   }, async (a, ctx) => {
     const name = a.session ? ctx.session(a.session).name : undefined;
-    const rows = core.repo.listScheduled(name, a.status, a.limit);
+    const rows = core.repo.listScheduled(name, a.status, a.limit, { broadcastId: a.broadcast_id, tag: a.tag });
     return {
-      scheduled: rows.map((r) => ({
-        id: r.id, session: r.session, to: r.to_jid, kind: r.kind, status: r.status, send_at: iso(r.send_at), attempts: r.attempts,
-        error: r.last_error ?? undefined, sent_message_id: r.sent_message_id ?? undefined,
-        preview: (JSON.parse(r.payload).text ?? JSON.parse(r.payload).caption ?? '').slice(0, 80),
-      })),
+      scheduled: rows.map((r) => {
+        let p: any = {};
+        try { p = JSON.parse(r.payload); } catch {}
+        return {
+          id: r.id, session: r.session, to: r.to_jid, kind: r.kind, status: r.status, send_at: iso(r.send_at), attempts: r.attempts,
+          error: r.last_error ?? undefined, sent_message_id: r.sent_message_id ?? undefined,
+          preview: (p.text ?? p.caption ?? '').slice(0, 80),
+          broadcast_id: p.broadcast_id ?? undefined,
+          tag: p.tag ?? undefined,
+        };
+      }),
     };
   });
 
   defineTool(env, 'cancel_scheduled', {
-    title: 'Cancel or release a scheduled message',
+    title: 'Cancel or release scheduled messages',
     description:
-      'Cancel a pending/held scheduled message by id. Messages are HELD (not sent) when the other side wrote after the message was scheduled: read the chat, then cancel it, or pass release=true to send it anyway.',
+      'Cancel pending/held scheduled messages by id, broadcast_id or tag. Messages are HELD (not sent) when the other side wrote after the message was scheduled: read the chat, then cancel it, or pass release=true to send it anyway.',
     toolset: 'messages',
     effect: 'local',
     idempotent: true,
-    input: { id: z.number().int(), release: z.boolean().optional().describe('For a held message: send it anyway in a few seconds.') },
+    input: {
+      id: z.number().int().optional().describe('ID of a single scheduled message to cancel or release.'),
+      broadcast_id: z.string().optional().describe('Cancel all pending/held messages belonging to this broadcast batch ID.'),
+      tag: z.string().optional().describe('Cancel all pending/held messages belonging to this campaign tag.'),
+      release: z.boolean().optional().describe('For a held message: send it anyway in a few seconds.'),
+    },
     network: false,
   }, async (a) => {
+    if (a.broadcast_id || a.tag) {
+      const cancelled = core.repo.cancelScheduledGroup(undefined, { broadcastId: a.broadcast_id, tag: a.tag });
+      return { broadcast_id: a.broadcast_id, tag: a.tag, cancelled_count: cancelled };
+    }
+    if (a.id === undefined) throw new Error('Provide "id", "broadcast_id", or "tag" to cancel.');
     const row = core.repo.getScheduled(a.id);
     if (!row) throw new Error(`No scheduled message #${a.id}`);
     if (row.status !== 'pending' && row.status !== 'held') throw new Error(`#${a.id} is already ${row.status}`);

@@ -75,8 +75,8 @@ El token fijo del modo HTTP está en `data/http-token` (o `WA_MCP_HTTP_TOKEN`). 
 
 | Grupo (`WA_MCP_TOOLSETS`) | Tools |
 |---|---|
-| `sessions` | `session_list` `session_pair` `session_status` `session_control` `session_logout` `session_delete` `profile_update` `privacy_settings` |
-| `messages` | `send_text` `send_media` (image/video/audio/voice/document/sticker) `send_location` `send_contacts` `send_poll` `send_event` `react_to_message` `edit_message` `delete_message` `forward_message` `pin_message` `set_presence` `mark_read` `schedule_message` `list_scheduled` `cancel_scheduled` `post_status` |
+| `sessions` | `session_list` `session_pair` `session_status` `session_control` `session_logout` `session_delete` `profile_update` `privacy_settings` `account_health` `configure_health_guard` |
+| `messages` | `send_text` `send_media` (image/video/audio/voice/document/sticker) `send_location` `send_contacts` `send_poll` `send_event` `react_to_message` `edit_message` `delete_message` `forward_message` `pin_message` `set_presence` `mark_read` `schedule_message` `broadcast_message` `list_scheduled` `cancel_scheduled` `post_status` |
 | `read` | **`inbox`** (no leídos + chats que esperan TU respuesta) **`follow_ups`** (chats que esperan SU respuesta) `inbox_dismiss` `list_chats` `get_chat` `get_messages` `get_message` `search_messages` (FTS5) `unread_summary` `load_older_history` `download_media` `get_events` (long-poll) `get_poll_results` |
 | `contacts` | `find_contacts` `check_numbers` `get_profile_picture` `get_about` `get_presence` `block_contact` `get_blocklist` `save_contact` `remove_contact` |
 | `chats` | `chat_action` (archivar, fijar, silenciar, no leído, destacar, temporales, vaciar, borrar) `labels` |
@@ -115,7 +115,9 @@ Ejemplo: *"recupera los clientes que no respondieron"* → `follow_ups {}`.
 
 ### Ahorro de tokens al leer
 
-- **Formato compacto por defecto** en `get_messages`, `inbox`, `unread_summary` y `search_messages`: transcripción de texto (`[16:25] Ana: hola #786FE2E3`) en la zona horaria del servidor, con día en encabezados, citas (`↪`), notas tuyas y reacciones integradas. En datos reales usa **55-72% menos tokens** que el JSON (más cuanto más corto es cada mensaje). `format:"json"` devuelve la estructura completa; `max_chars` recorta textos largos (600 por defecto, `get_message` da el texto íntegro); `ids:false` quita los ids.
+- **Formato compacto y modo digest:** `get_messages` soporta `format: "compact"` (por defecto, ~65% menos tokens), `format: "json"` (estructura completa) y **`format: "digest"`** (resumen ejecutivo de alta densidad: extrae archivos y documentos adjuntos con sus IDs, tareas/pendientes y el intercambio reciente, ahorrando hasta un **80% de tokens** en historiales largos).
+- **Descarga directa al workspace:** `download_media` acepta `destination_dir` (ej. `./addons/` o ruta del proyecto) y `destination_file`, copiando automáticamente el archivo adjunto descargado al directorio destino del agente con validación de seguridad contra rutas protegidas.
+- **Suscripciones MCP en tiempo real (`resources/subscribe`):** Soporta el estándar oficial de MCP para recursos dinámicos. Clientes como Paseo, Claude o Codex pueden suscribirse a `whatsapp://events/latest`, `whatsapp://{session}/events` o `whatsapp://{session}/chat/{jid}/stream` y recibir notificaciones push instantáneas (`resources/updated`) cada vez que entra un mensaje o evento.
 - **IDs cortos:** cada mensaje termina en `#` + últimos 8 caracteres. Cualquier herramienta que reciba `message_id`, `quoted_id`, `poll_id` o `after_message_id` los acepta (también con 5-16 caracteres si son únicos).
 - **Lectura incremental:** `get_messages {chat, unseen_only:true}` devuelve solo lo posterior a lo que ese cliente ya leyó del chat (en ambas direcciones); sin novedades responde en una línea. `after_message_id` hace lo mismo desde un mensaje concreto. `inbox {skip_seen:true}` no repite mensajes ya mostrados.
 - La respuesta compacta lleva como `structuredContent` solo metadatos mínimos (conteo, cursor), no el texto duplicado.
@@ -132,6 +134,40 @@ Mientras el LLM analiza qué contestar, el cliente puede escribir algo nuevo. Po
 - Se puede saltar con `ignore_new_messages: true` (solo si el usuario lo pide) o desactivar con `WA_MCP_FRESHNESS_GUARD=0`.
 
 Limitación: solo ve los mensajes que ya llegaron a este servidor; uno que aún esté en tránsito por la red de WhatsApp no se puede detectar.
+
+### Difusión Segura con Jitter Anti-Ban (`broadcast_message`)
+
+Envía o encola mensajes masivos personalizados a múltiples destinatarios protegiendo la cuenta contra bloqueos y baneos por parte de Meta:
+
+- **Jitter Aleatorio Anti-Ban**: Delays variables y aleatorios entre cada envío (por defecto entre 15 y 35 segundos, configurable mediante `min_delay_seconds` y `max_delay_seconds`).
+- **Pausa por Lotes (*Batch Cooldown*)**: Tras cada bloque de `batch_size` mensajes (por defecto 5), introduce automáticamente un descanso extendido de `cooldown_seconds` (por defecto 60s) para emular el comportamiento humano.
+- **Variables Dinámicas de Contacto**: Soporta plantillas con interpolación automática desde la libreta de contactos local:
+  - `{{name}}`: Nombre completo del contacto o chat (o `"Cliente"` si no se conoce).
+  - `{{first_name}}`: Primer nombre del destinatario.
+  - `{{phone}}`: Número de teléfono limpio.
+  - `{{variable}}`: Variables arbitrarias pasadas en el parámetro `variables: { "<phone_or_name>": { "saldo": "S/ 120", "vence": "28/11" } }`.
+- **Modo Simulación (`dry_run: true`)**: Permite previsualizar la lista procesada, detectar duplicados omitidos, destinatarios inválidos, variables no suministradas y el cronograma exacto estimado de envíos antes de tocar la base de datos.
+- **Persistencia y Resiliencia**: Los mensajes se programan de forma duradera en SQLite (`scheduled_messages`) asociados a un `broadcast_id` y `tag` opcional. Si el servidor se apaga o reinicia, la campaña continúa su curso sin duplicar envíos.
+- **Cancelación y Gestión por Lote**: Con `cancel_scheduled { broadcast_id }` o `cancel_scheduled { tag }` es posible cancelar una campaña completa con una sola llamada.
+- **Filtro en Listado**: `list_scheduled` permite filtrar mensajes programados por `tag` o `broadcast_id`.
+
+### Guardián de Salud de Cuenta y Circuit Breaker (`account_health`)
+
+Protege la cuenta contra el algoritmo de baneo y suspensión de Meta mediante una ventana deslizante de métricas en tiempo real y corte automático de emergencia:
+
+- **Los 3 Pilares del Algoritmo de Meta (Investigados a Fondo)**:
+  1. *Outreach Frío vs. Simetría Inbound*: Enviar mensajes a números que no te tienen guardado ni han hablado antes sin el token de privacidad (`tctoken`) activa el **Error 463 (*Reachout Timelocked*)**. Además, cuentas con más del 80% de tráfico saliente unilateral acumulan puntaje de riesgo de bot.
+  2. *Tasa de Reporte y Bloqueo (*User Friction*)*: Cuando un destinatario frío presiona "Reportar Spam" o "Bloquear", WhatsApp envía un recibo de telemetría silencioso. Si la tasa de bloqueo supera entre el **3% y el 5%** en 24h, el sistema de Meta aplica suspensión automática.
+  3. *Velocidad y Ráfagas*: Disparar más de 25-35 mensajes fríos por hora activa disparadores heurísticos de spam.
+- **Puntuación de Riesgo Dinámica (0 - 100)**: Evalúa velocidad en 1h, volumen en 24h, asimetría de tráfico y otorga crédito de recuperación por cada mensaje entrante de clientes legítimos.
+- **Circuit Breaker Anti-Suspensión**:
+  - Si el score supera 85 o se alcanza el límite horario (`max_cold_per_hour`, por defecto 25): **se dispara el Circuit Breaker**.
+  - **Bloquea envíos a números fríos (desconocidos)** durante el tiempo de enfriamiento (`cooldown_minutes`, por defecto 45m).
+  - **Permite responder a clientes existentes** que te escriban (atender chats entrantes reduce el riesgo y restaura la salud de la cuenta).
+  - Captura automática de `Error 463`: si Meta responde con reachout timelock, el breaker salta de inmediato protegiendo el socket.
+- **Herramientas**:
+  - `account_health`: Muestra el semáforo de salud, métricas de 1h y 24h, estado del circuit breaker y diagnóstico detallado de las heurísticas de Meta.
+  - `configure_health_guard`: Permite ajustar umbrales (`max_cold_per_hour`, `cooldown_minutes`) o resetear manualmente el breaker (`reset_circuit_breaker: true`).
 
 ### Línea de tiempo: lo que haces *fuera* del chat
 

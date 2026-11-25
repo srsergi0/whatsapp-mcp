@@ -81,8 +81,11 @@ export function createMcpServer(core: Core): { server: McpServer; dispose: () =>
 
   const onEvent = (ev: WaEvent) => {
     try {
+      touch(uris.events(ev.session));
+      touch(uris.eventsLatest());
       if (['message.in', 'message.out', 'message.update', 'reaction', 'poll.vote'].includes(ev.type) && ev.chat) {
         touch(uris.messages(ev.session, ev.chat));
+        touch(uris.chatStream(ev.session, ev.chat));
         touch(uris.chats(ev.session));
         touch(uris.unread(ev.session));
         touch(uris.inbox(ev.session));

@@ -289,4 +289,48 @@ ALTER TABLE interactions ADD COLUMN resolved_at INTEGER;
 ALTER TABLE interactions ADD COLUMN resolved_by TEXT;
 CREATE INDEX idx_interactions_waiting ON interactions(session, jid, kind, status);
 `,
+  /* 5: BM25 upgrade: index media_name in messages_fts and add interactions_fts */ `
+DROP TABLE IF EXISTS messages_fts;
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+  text, caption, sender_name, media_name,
+  content='messages', content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2'
+);
+INSERT INTO messages_fts(rowid, text, caption, sender_name, media_name)
+SELECT rowid, text, caption, sender_name, media_name FROM messages;
+
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
+
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, text, caption, sender_name, media_name) VALUES (new.rowid, new.text, new.caption, new.sender_name, new.media_name);
+END;
+CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, text, caption, sender_name, media_name) VALUES ('delete', old.rowid, old.text, old.caption, old.sender_name, old.media_name);
+END;
+CREATE TRIGGER messages_au AFTER UPDATE OF text, caption, sender_name, media_name ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, text, caption, sender_name, media_name) VALUES ('delete', old.rowid, old.text, old.caption, old.sender_name, old.media_name);
+  INSERT INTO messages_fts(rowid, text, caption, sender_name, media_name) VALUES (new.rowid, new.text, new.caption, new.sender_name, new.media_name);
+END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS interactions_fts USING fts5(
+  note, kind,
+  content='interactions', content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+INSERT INTO interactions_fts(rowid, note, kind)
+SELECT id, note, kind FROM interactions;
+
+CREATE TRIGGER IF NOT EXISTS interactions_ai AFTER INSERT ON interactions BEGIN
+  INSERT INTO interactions_fts(rowid, note, kind) VALUES (new.id, new.note, new.kind);
+END;
+CREATE TRIGGER IF NOT EXISTS interactions_ad AFTER DELETE ON interactions BEGIN
+  INSERT INTO interactions_fts(interactions_fts, rowid, note, kind) VALUES ('delete', old.id, old.note, old.kind);
+END;
+CREATE TRIGGER IF NOT EXISTS interactions_au AFTER UPDATE OF note, kind ON interactions BEGIN
+  INSERT INTO interactions_fts(interactions_fts, rowid, note, kind) VALUES ('delete', old.id, old.note, old.kind);
+  INSERT INTO interactions_fts(rowid, note, kind) VALUES (new.id, new.note, new.kind);
+END;
+`,
 ];

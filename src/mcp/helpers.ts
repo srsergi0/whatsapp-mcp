@@ -15,7 +15,7 @@ export interface Env {
   core: Core;
 }
 
-export const sessionField = z.string().optional().describe('Session name. Optional when only one session exists.');
+export const sessionField = z.string().optional().describe('Session name. Required when more than one session exists (the error lists them).');
 export const chatField = z.string().describe('Chat: phone with country code (e.g. 5491112345678), a full jid (…@s.whatsapp.net / …@g.us), or a saved contact/group name.');
 export const jidField = z.string().describe('Phone with country code (e.g. 5491112345678) or full jid.');
 export const limitField = (def: number, max: number) => z.number().int().min(1).max(max).default(def).describe(`Max results (default ${def}, max ${max}).`);
