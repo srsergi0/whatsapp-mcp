@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { NodeStreamableHTTPServerTransport as StreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { isInitializeRequest } from '@modelcontextprotocol/server';
 import type { Config } from './config.js';
 import type { Core } from './core.js';
 import { createMcpServer } from './mcp/server.js';

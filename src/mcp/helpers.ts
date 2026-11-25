@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { CallToolResult, ContentBlock } from '@modelcontextprotocol/sdk/types.js';
+import type { McpServer, CallToolResult, ContentBlock } from '@modelcontextprotocol/server';
 import type { Core } from '../core.js';
 import type { Toolset } from '../config.js';
 import { errMsg } from '../util.js';
@@ -148,22 +147,24 @@ export class Ctx {
   }
 
   async log(level: 'debug' | 'info' | 'notice' | 'warning' | 'error', data: unknown) {
+    // Same channel as server.ts clientLog (deprecated in 2026-07-28; change both together).
     try { await this.server.sendLoggingMessage({ level, logger: 'whatsapp', data }); } catch { /* client may not accept logs */ }
   }
 
   async progress(progress: number, total?: number, message?: string) {
-    const token = this.extra?._meta?.progressToken;
+    const token = this.extra?.mcpReq?._meta?.progressToken;
     if (token === undefined) return;
-    try { await this.extra.sendNotification({ method: 'notifications/progress', params: { progressToken: token, progress, ...(total ? { total } : {}), ...(message ? { message } : {}) } }); } catch { /* ignore */ }
+    try { await this.extra.mcpReq.notify({ method: 'notifications/progress', params: { progressToken: token, progress, ...(total ? { total } : {}), ...(message ? { message } : {}) } }); } catch { /* ignore */ }
   }
 
   /** Irreversible actions: explicit flag, or ask the user through MCP elicitation when supported. */
   async confirm(flag: boolean | undefined, message: string): Promise<void> {
     if (flag === true) return;
     const caps = this.server.server.getClientCapabilities();
-    if (caps?.elicitation) {
+    if (caps?.elicitation && this.extra?.mcpReq?.elicitInput) {
       try {
-        const r = await this.server.server.elicitInput({
+        // 2025-era push elicitation; on 2026-07-28 clients it throws and we fall back to the flag.
+        const r = await this.extra.mcpReq.elicitInput({
           message,
           requestedSchema: { type: 'object', properties: { confirm: { type: 'boolean', title: 'Yes, do it', description: message } }, required: ['confirm'] },
         });
@@ -193,22 +194,15 @@ export function defineTool<S extends z.ZodRawShape>(
   const readOnlyMode = env.core.cfg.readOnly;
   if (readOnlyMode && effect === 'wa') return; // hide mutating tools entirely in read-only mode
 
-  (env.server as any).registerTool(
-    name,
-    {
-      title: def.title,
-      description: def.description,
-      inputSchema: def.input,
-      ...(def.output ? { outputSchema: def.output } : {}),
-      annotations: {
-        title: def.title,
-        readOnlyHint: effect === 'read',
-        destructiveHint: effect === 'read' ? false : !!def.destructive,
-        idempotentHint: effect === 'read' ? true : !!def.idempotent,
-        openWorldHint: def.network ?? effect === 'wa',
-      },
-    },
-    async (args: any, extra: any): Promise<CallToolResult> => {
+  const annotations = {
+    title: def.title,
+    readOnlyHint: effect === 'read',
+    destructiveHint: effect === 'read' ? false : !!def.destructive,
+    idempotentHint: effect === 'read' ? true : !!def.idempotent,
+    openWorldHint: def.network ?? effect === 'wa',
+  };
+
+  const run = async (args: any, extra: any): Promise<CallToolResult> => {
       const ctx = new Ctx(env, extra, name);
       args = expandShortIds(env.core, args);
       const target = args?.chat ?? args?.to ?? args?.jid ?? args?.group ?? args?.name ?? null;
@@ -226,6 +220,13 @@ export function defineTool<S extends z.ZodRawShape>(
         env.core.log.debug({ tool: name, err: msg }, 'tool error');
         return fail(msg);
       }
-    },
-  );
+  };
+
+  (env.server as any).registerTool(name, {
+    title: def.title,
+    description: def.description,
+    inputSchema: def.input,
+    ...(def.output ? { outputSchema: def.output } : {}),
+    annotations,
+  }, run);
 }

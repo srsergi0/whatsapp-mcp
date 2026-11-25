@@ -1,5 +1,5 @@
 import fsp from 'node:fs/promises';
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
 import { iso } from '../util.js';
 import type { Core } from '../core.js';
 import { downloadStoredMedia } from '../wa/ingest.js';

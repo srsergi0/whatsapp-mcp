@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { Db } from '../db/database.js';
 import { Repo } from '../db/repo.js';
 
@@ -147,7 +147,7 @@ test('server_info', async () => {
 
 test('streamable HTTP transport with bearer auth', async () => {
   const { spawn } = await import('node:child_process');
-  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
   const port = 39000 + Math.floor(Math.random() * 500);
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-mcp-http-'));
   const child = spawn(process.execPath, [entry, '--http'], {

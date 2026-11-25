@@ -1,5 +1,4 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { SubscribeRequestSchema, UnsubscribeRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import type { Core, WaEvent } from '../core.js';
 import { errMsg } from '../util.js';
 import { isGroupJid } from '../wa/jid.js';
@@ -49,6 +48,11 @@ export function createMcpServer(core: Core): { server: McpServer; dispose: () =>
     },
   );
 
+  /* Every client-facing log line goes through here: MCP logging is deprecated in the 2026-07-28 spec, swap it in one place. */
+  const clientLog = (level: 'info' | 'notice', data: Record<string, unknown>) => {
+    void server.sendLoggingMessage({ level, logger: 'whatsapp', data }).catch(() => undefined);
+  };
+
   const env = { server, core };
   registerSessionTools(env);
   registerMessageTools(env);
@@ -65,8 +69,8 @@ export function createMcpServer(core: Core): { server: McpServer; dispose: () =>
   /* ----------------------- resource subscriptions + notifications ----------------------- */
 
   const subscribed = new Set<string>();
-  server.server.setRequestHandler(SubscribeRequestSchema, async (req) => { subscribed.add(req.params.uri); return {}; });
-  server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => { subscribed.delete(req.params.uri); return {}; });
+  server.server.setRequestHandler('resources/subscribe', async (req) => { subscribed.add(req.params.uri); return {}; });
+  server.server.setRequestHandler('resources/unsubscribe', async (req) => { subscribed.delete(req.params.uri); return {}; });
 
   const touch = (uri: string) => {
     if (subscribed.has(uri)) void server.server.sendResourceUpdated({ uri }).catch(() => undefined);
@@ -92,21 +96,15 @@ export function createMcpServer(core: Core): { server: McpServer; dispose: () =>
       }
       if (ev.type === 'connection') {
         touch(uris.status(ev.session));
-        void server.sendLoggingMessage({ level: 'info', logger: 'whatsapp', data: { session: ev.session, connection: ev.payload.state, reason: ev.payload.reason ?? undefined } }).catch(() => undefined);
+        clientLog('info', { session: ev.session, connection: ev.payload.state, reason: ev.payload.reason ?? undefined });
       } else if (ev.type === 'message.in') {
         const p = new Presenter(core, ev.session);
-        void server.sendLoggingMessage({
-          level: 'notice', logger: 'whatsapp',
-          data: { session: ev.session, event: 'message.in', chat: p.name(ev.chat) ?? ev.chat, preview: String(ev.payload.text ?? `[${ev.payload.type}]`).slice(0, 120), id: ev.payload.id },
-        }).catch(() => undefined);
+        clientLog('notice', { session: ev.session, event: 'message.in', chat: p.name(ev.chat) ?? ev.chat, preview: String(ev.payload.text ?? `[${ev.payload.type}]`).slice(0, 120), id: ev.payload.id });
       } else if (ev.type === 'waiting.replied' || ev.type === 'waiting.overdue') {
         const p = new Presenter(core, ev.session);
-        void server.sendLoggingMessage({
-          level: 'notice', logger: 'whatsapp',
-          data: ev.type === 'waiting.replied'
-            ? { session: ev.session, event: 'they replied', chat: p.name(ev.chat) ?? ev.chat, preview: ev.payload.preview, waiting: ev.payload.waiting?.map((w: any) => w.note) }
-            : { session: ev.session, event: 'reply overdue', chat: p.name(ev.chat) ?? ev.chat, waiting_for: ev.payload.note },
-        }).catch(() => undefined);
+        clientLog('notice', ev.type === 'waiting.replied'
+          ? { session: ev.session, event: 'they replied', chat: p.name(ev.chat) ?? ev.chat, preview: ev.payload.preview, waiting: ev.payload.waiting?.map((w: any) => w.note) }
+          : { session: ev.session, event: 'reply overdue', chat: p.name(ev.chat) ?? ev.chat, waiting_for: ev.payload.note });
       }
       if (allowedForChannel(ev)) {
         const p = new Presenter(core, ev.session);

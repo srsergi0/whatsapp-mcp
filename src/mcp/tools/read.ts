@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
-import type { ContentBlock } from '@modelcontextprotocol/sdk/types.js';
+import type { ContentBlock } from '@modelcontextprotocol/server';
 import { decodeCursor, encodeCursor } from '../../db/repo.js';
 import { iso, sleep } from '../../util.js';
 import { downloadStoredMedia } from '../../wa/ingest.js';

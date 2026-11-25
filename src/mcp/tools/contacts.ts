@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ContentBlock } from '@modelcontextprotocol/sdk/types.js';
+import type { ContentBlock } from '@modelcontextprotocol/server';
 import { iso, sleep } from '../../util.js';
 import { bare, normalizePhone, phoneOf, toJid } from '../../wa/jid.js';
 import { fetchLimited } from '../../wa/media.js';

@@ -1,6 +1,6 @@
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import type { JSONRPCMessage } from '@modelcontextprotocol/server';
 import type { LockInfo } from './lock.js';
 import { errMsg } from './util.js';
 

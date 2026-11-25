@@ -14,7 +14,13 @@
     "!dist/**/*.map",
     ".env.example"
   ],
-  "keywords": ["mcp", "model-context-protocol", "whatsapp", "baileys", "claude"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "whatsapp",
+    "baileys",
+    "claude"
+  ],
   "engines": {
     "node": ">=22.13.0"
   },
@@ -32,7 +38,9 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/server": "^2.4.0",
     "baileys": "^7.0.0-rc14",
     "pino": "^10.4.0",
     "sharp": "^0.35.5",

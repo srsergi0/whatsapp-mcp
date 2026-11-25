@@ -3,7 +3,7 @@ import './boot.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { loadConfig, type Config } from './config.js';
 import { Core } from './core.js';
 import { startHttpBridge } from './http.js';
